@@ -1,0 +1,438 @@
+// Aplikasi Absensi Karyawan/Siswa v2 - versi terminal (console)
+// Fitur baru: edit/hapus data, rekap rentang tanggal, absen otomatis via kode QR
+//
+// Compile : g++ -std=c++17 absensi_v2.cpp -o absensi
+// Jalankan: ./absensi   (Windows: absensi.exe)
+//
+// Catatan QR: setiap anggota punya kode unik (mis. ABS-0001-3F9A) yang dapat
+// dicetak sebagai gambar QR memakai QR generator apa pun. Alat pemindai QR
+// (scanner USB/aplikasi di HP) bekerja seperti keyboard: ia mengetik isi kode
+// lalu menekan Enter. Jadi menu "Absen otomatis" cukup membaca satu baris kode.
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <map>
+#include <iomanip>
+#include <ctime>
+#include <limits>
+#include <random>
+#include <algorithm>
+#include <cctype>
+
+using namespace std;
+
+struct Anggota {
+    int id;
+    string nama;
+    string peran;   // Karyawan / Siswa
+    string kodeQR;  // contoh: ABS-0001-3F9A
+};
+
+struct Absen {
+    int idAnggota;
+    string tanggal; // YYYY-MM-DD
+    string jam;     // HH:MM:SS
+    string status;  // Hadir / Izin / Sakit / Alpha
+};
+
+const string FILE_ANGGOTA = "anggota.csv";
+const string FILE_ABSEN = "absensi.csv";
+const char* STATUS[] = {"Hadir", "Izin", "Sakit", "Alpha"};
+
+vector<Anggota> daftarAnggota;
+vector<Absen> daftarAbsen;
+
+// ---------- Utilitas ----------
+
+string waktuSekarang(const char* fmt) {
+    time_t t = time(nullptr);
+    char buf[32];
+    strftime(buf, sizeof(buf), fmt, localtime(&t));
+    return buf;
+}
+
+vector<string> pisah(const string& s, char sep) {
+    vector<string> out;
+    string item;
+    stringstream ss(s);
+    while (getline(ss, item, sep)) out.push_back(item);
+    return out;
+}
+
+string trim(const string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+string bacaBaris(const string& prompt) {
+    cout << prompt;
+    string s;
+    getline(cin, s);
+    return trim(s);
+}
+
+int bacaAngka(const string& prompt) {
+    int x;
+    while (true) {
+        cout << prompt;
+        if (cin >> x) { cin.ignore(numeric_limits<streamsize>::max(), '\n'); return x; }
+        if (cin.eof()) exit(0);
+        cin.clear();
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        cout << "Input harus angka!\n";
+    }
+}
+
+bool konfirmasi(const string& pertanyaan) {
+    string j = bacaBaris(pertanyaan + " (y/n): ");
+    return !j.empty() && (j[0] == 'y' || j[0] == 'Y');
+}
+
+// Validasi format YYYY-MM-DD
+bool tanggalValid(const string& t) {
+    if (t.size() != 10 || t[4] != '-' || t[7] != '-') return false;
+    for (size_t i = 0; i < t.size(); i++) {
+        if (i == 4 || i == 7) continue;
+        if (!isdigit((unsigned char)t[i])) return false;
+    }
+    int bln = stoi(t.substr(5, 2)), hari = stoi(t.substr(8, 2));
+    return bln >= 1 && bln <= 12 && hari >= 1 && hari <= 31;
+}
+
+string bacaTanggal(const string& prompt) {
+    while (true) {
+        string t = bacaBaris(prompt);
+        if (tanggalValid(t)) return t;
+        cout << "Format tanggal salah! Gunakan YYYY-MM-DD, contoh 2026-10-01\n";
+    }
+}
+
+string bersihkanKoma(string s) {
+    for (auto& c : s) if (c == ',') c = ' ';
+    return s;
+}
+
+string namaStatus(int pilihan) { return STATUS[pilihan - 1]; }
+
+// ---------- Penyimpanan ----------
+
+Anggota* cariAnggota(int id) {
+    for (auto& a : daftarAnggota) if (a.id == id) return &a;
+    return nullptr;
+}
+
+Anggota* cariAnggotaByKode(const string& kode) {
+    string k = kode;
+    transform(k.begin(), k.end(), k.begin(), ::toupper);
+    for (auto& a : daftarAnggota) if (a.kodeQR == k) return &a;
+    return nullptr;
+}
+
+Absen* cariAbsen(int id, const string& tgl) {
+    for (auto& b : daftarAbsen) if (b.idAnggota == id && b.tanggal == tgl) return &b;
+    return nullptr;
+}
+
+string buatKodeQR(int id) {
+    static mt19937 rng((unsigned)time(nullptr));
+    while (true) {
+        stringstream ss;
+        ss << "ABS-" << setw(4) << setfill('0') << id << "-"
+           << uppercase << hex << setw(4) << setfill('0') << (rng() % 0x10000);
+        if (!cariAnggotaByKode(ss.str())) return ss.str();
+    }
+}
+
+void simpanData() {
+    ofstream fa(FILE_ANGGOTA);
+    for (auto& a : daftarAnggota)
+        fa << a.id << ',' << a.nama << ',' << a.peran << ',' << a.kodeQR << '\n';
+    ofstream fb(FILE_ABSEN);
+    for (auto& b : daftarAbsen)
+        fb << b.idAnggota << ',' << b.tanggal << ',' << b.jam << ',' << b.status << '\n';
+}
+
+void muatData() {
+    ifstream fa(FILE_ANGGOTA);
+    string baris;
+    bool perluSimpan = false;
+    while (getline(fa, baris)) {
+        auto p = pisah(trim(baris), ',');
+        if (p.size() >= 3) {
+            Anggota a{stoi(p[0]), p[1], p[2], p.size() >= 4 ? p[3] : ""};
+            if (a.kodeQR.empty()) { a.kodeQR = buatKodeQR(a.id); perluSimpan = true; }
+            daftarAnggota.push_back(a);
+        }
+    }
+    ifstream fb(FILE_ABSEN);
+    while (getline(fb, baris)) {
+        auto p = pisah(trim(baris), ',');
+        if (p.size() == 4) daftarAbsen.push_back({stoi(p[0]), p[1], p[2], p[3]});
+    }
+    if (perluSimpan) simpanData(); // data versi lama otomatis diberi kode QR
+}
+
+// ---------- Tampilan ----------
+
+void tampilAnggota() {
+    cout << "\n" << left << setw(5) << "ID" << setw(25) << "Nama" << setw(10) << "Peran" << "\n";
+    cout << string(40, '-') << "\n";
+    for (auto& a : daftarAnggota)
+        cout << left << setw(5) << a.id << setw(25) << a.nama << setw(10) << a.peran << "\n";
+    if (daftarAnggota.empty()) cout << "(belum ada data)\n";
+}
+
+void tampilKodeQR() {
+    cout << "\nKODE QR ANGGOTA (cetak kode ini sebagai gambar QR)\n";
+    cout << left << setw(5) << "ID" << setw(25) << "Nama" << setw(16) << "Kode QR" << "\n";
+    cout << string(46, '-') << "\n";
+    for (auto& a : daftarAnggota)
+        cout << left << setw(5) << a.id << setw(25) << a.nama << setw(16) << a.kodeQR << "\n";
+    if (daftarAnggota.empty()) cout << "(belum ada data)\n";
+}
+
+void tampilRiwayat(int id) {
+    cout << "\nRiwayat absensi:\n";
+    cout << left << setw(13) << "Tanggal" << setw(10) << "Jam" << setw(8) << "Status" << "\n";
+    cout << string(31, '-') << "\n";
+    int n = 0;
+    for (auto& b : daftarAbsen) {
+        if (b.idAnggota != id) continue;
+        cout << left << setw(13) << b.tanggal << setw(10) << b.jam << setw(8) << b.status << "\n";
+        n++;
+    }
+    if (n == 0) cout << "(belum ada riwayat)\n";
+}
+
+// ---------- Kelola anggota ----------
+
+void tambahAnggota() {
+    Anggota a;
+    int maxId = 0;
+    for (auto& x : daftarAnggota) maxId = max(maxId, x.id);
+    a.id = maxId + 1;
+    a.nama = bersihkanKoma(bacaBaris("Nama lengkap : "));
+    if (a.nama.empty()) { cout << "[ERROR] Nama tidak boleh kosong.\n"; return; }
+    int p = bacaAngka("Peran (1=Karyawan, 2=Siswa): ");
+    a.peran = (p == 1) ? "Karyawan" : "Siswa";
+    a.kodeQR = buatKodeQR(a.id);
+    daftarAnggota.push_back(a);
+    simpanData();
+    cout << "[OK] " << a.nama << " ditambahkan. ID: " << a.id << ", Kode QR: " << a.kodeQR << "\n";
+}
+
+void editAnggota() {
+    tampilAnggota();
+    int id = bacaAngka("\nMasukkan ID anggota yang diedit: ");
+    Anggota* a = cariAnggota(id);
+    if (!a) { cout << "[ERROR] ID tidak ditemukan.\n"; return; }
+
+    cout << "Data saat ini: " << a->nama << " (" << a->peran << ")\n";
+    string nama = bersihkanKoma(bacaBaris("Nama baru (kosongkan jika tidak diubah): "));
+    if (!nama.empty()) a->nama = nama;
+    int p = bacaAngka("Peran baru (1=Karyawan, 2=Siswa, 0=tidak diubah): ");
+    if (p == 1) a->peran = "Karyawan";
+    else if (p == 2) a->peran = "Siswa";
+    simpanData();
+    cout << "[OK] Data anggota diperbarui: " << a->nama << " (" << a->peran << ")\n";
+}
+
+void hapusAnggota() {
+    tampilAnggota();
+    int id = bacaAngka("\nMasukkan ID anggota yang dihapus: ");
+    Anggota* a = cariAnggota(id);
+    if (!a) { cout << "[ERROR] ID tidak ditemukan.\n"; return; }
+
+    cout << "Menghapus " << a->nama << " juga akan menghapus seluruh riwayat absensinya.\n";
+    if (!konfirmasi("Yakin hapus?")) { cout << "[INFO] Dibatalkan.\n"; return; }
+
+    string nama = a->nama;
+    daftarAbsen.erase(remove_if(daftarAbsen.begin(), daftarAbsen.end(),
+                      [id](const Absen& b) { return b.idAnggota == id; }), daftarAbsen.end());
+    daftarAnggota.erase(remove_if(daftarAnggota.begin(), daftarAnggota.end(),
+                        [id](const Anggota& x) { return x.id == id; }), daftarAnggota.end());
+    simpanData();
+    cout << "[OK] " << nama << " dan riwayat absensinya dihapus.\n";
+}
+
+// ---------- Absensi ----------
+
+void catatAbsen() {
+    tampilAnggota();
+    int id = bacaAngka("\nMasukkan ID anggota: ");
+    Anggota* a = cariAnggota(id);
+    if (!a) { cout << "[ERROR] ID tidak ditemukan.\n"; return; }
+
+    string tgl = waktuSekarang("%Y-%m-%d");
+    if (Absen* b = cariAbsen(id, tgl)) {
+        cout << "[INFO] " << a->nama << " sudah absen hari ini (" << b->status << ").\n";
+        return;
+    }
+    int s = bacaAngka("Status (1=Hadir, 2=Izin, 3=Sakit, 4=Alpha): ");
+    if (s < 1 || s > 4) { cout << "[ERROR] Pilihan status tidak valid.\n"; return; }
+
+    daftarAbsen.push_back({id, tgl, waktuSekarang("%H:%M:%S"), namaStatus(s)});
+    simpanData();
+    cout << "[OK] Absen " << a->nama << " tercatat: " << namaStatus(s) << " pukul "
+         << daftarAbsen.back().jam << "\n";
+}
+
+// Absen otomatis: membaca kode dari scanner QR (atau diketik manual)
+void absenQR() {
+    cout << "\n=== ABSEN OTOMATIS (SCAN QR) ===\n"
+         << "Arahkan scanner ke kode QR. Ketik 'selesai' untuk kembali ke menu.\n";
+    while (true) {
+        string kode = bacaBaris("Scan kode QR > ");
+        if (cin.eof() || kode == "selesai" || kode == "SELESAI") return;
+        if (kode.empty()) continue;
+
+        Anggota* a = cariAnggotaByKode(kode);
+        if (!a) { cout << "[ERROR] Kode QR tidak dikenal: " << kode << "\n"; continue; }
+
+        string tgl = waktuSekarang("%Y-%m-%d");
+        if (Absen* b = cariAbsen(a->id, tgl)) {
+            cout << "[INFO] " << a->nama << " sudah absen hari ini pukul " << b->jam
+                 << " (" << b->status << ").\n";
+            continue;
+        }
+        daftarAbsen.push_back({a->id, tgl, waktuSekarang("%H:%M:%S"), "Hadir"});
+        simpanData();
+        cout << "[OK] Selamat datang, " << a->nama << " (" << a->peran << ")! Hadir pukul "
+             << daftarAbsen.back().jam << "\n";
+    }
+}
+
+void editAbsen() {
+    tampilAnggota();
+    int id = bacaAngka("\nMasukkan ID anggota: ");
+    Anggota* a = cariAnggota(id);
+    if (!a) { cout << "[ERROR] ID tidak ditemukan.\n"; return; }
+    cout << "Anggota: " << a->nama;
+    tampilRiwayat(id);
+
+    string tgl = bacaTanggal("\nTanggal absensi yang diedit (YYYY-MM-DD): ");
+    Absen* b = cariAbsen(id, tgl);
+    if (!b) { cout << "[ERROR] Tidak ada absensi pada tanggal tersebut.\n"; return; }
+
+    cout << "Status saat ini: " << b->status << "\n";
+    int s = bacaAngka("Status baru (1=Hadir, 2=Izin, 3=Sakit, 4=Alpha): ");
+    if (s < 1 || s > 4) { cout << "[ERROR] Pilihan status tidak valid.\n"; return; }
+    b->status = namaStatus(s);
+    simpanData();
+    cout << "[OK] Absensi " << a->nama << " tanggal " << tgl << " diubah menjadi " << b->status << "\n";
+}
+
+void hapusAbsen() {
+    tampilAnggota();
+    int id = bacaAngka("\nMasukkan ID anggota: ");
+    Anggota* a = cariAnggota(id);
+    if (!a) { cout << "[ERROR] ID tidak ditemukan.\n"; return; }
+    cout << "Anggota: " << a->nama;
+    tampilRiwayat(id);
+
+    string tgl = bacaTanggal("\nTanggal absensi yang dihapus (YYYY-MM-DD): ");
+    if (!cariAbsen(id, tgl)) { cout << "[ERROR] Tidak ada absensi pada tanggal tersebut.\n"; return; }
+    if (!konfirmasi("Yakin hapus absensi ini?")) { cout << "[INFO] Dibatalkan.\n"; return; }
+
+    daftarAbsen.erase(remove_if(daftarAbsen.begin(), daftarAbsen.end(),
+                      [&](const Absen& x) { return x.idAnggota == id && x.tanggal == tgl; }),
+                      daftarAbsen.end());
+    simpanData();
+    cout << "[OK] Absensi " << a->nama << " tanggal " << tgl << " dihapus.\n";
+}
+
+void absenHariIni() {
+    string tgl = waktuSekarang("%Y-%m-%d");
+    cout << "\nDaftar absensi tanggal " << tgl << "\n";
+    cout << left << setw(5) << "ID" << setw(25) << "Nama" << setw(10) << "Jam" << setw(8) << "Status" << "\n";
+    cout << string(48, '-') << "\n";
+    int n = 0;
+    for (auto& b : daftarAbsen) {
+        if (b.tanggal != tgl) continue;
+        Anggota* a = cariAnggota(b.idAnggota);
+        cout << left << setw(5) << b.idAnggota << setw(25) << (a ? a->nama : "?")
+             << setw(10) << b.jam << setw(8) << b.status << "\n";
+        n++;
+    }
+    if (n == 0) cout << "(belum ada yang absen hari ini)\n";
+}
+
+// ---------- Rekap ----------
+
+// dari/sampai kosong = seluruh data. Perbandingan string YYYY-MM-DD sama dengan urutan tanggal.
+void rekapAbsensi(const string& dari = "", const string& sampai = "") {
+    cout << "\nREKAP ABSENSI";
+    if (!dari.empty()) cout << " (" << dari << " s/d " << sampai << ")";
+    cout << "\n" << left << setw(5) << "ID" << setw(22) << "Nama"
+         << setw(8) << "Hadir" << setw(8) << "Izin" << setw(8) << "Sakit" << setw(8) << "Alpha" << "\n";
+    cout << string(59, '-') << "\n";
+    for (auto& a : daftarAnggota) {
+        map<string, int> hitung;
+        for (auto& b : daftarAbsen) {
+            if (b.idAnggota != a.id) continue;
+            if (!dari.empty() && (b.tanggal < dari || b.tanggal > sampai)) continue;
+            hitung[b.status]++;
+        }
+        cout << left << setw(5) << a.id << setw(22) << a.nama
+             << setw(8) << hitung["Hadir"] << setw(8) << hitung["Izin"]
+             << setw(8) << hitung["Sakit"] << setw(8) << hitung["Alpha"] << "\n";
+    }
+    if (daftarAnggota.empty()) cout << "(belum ada data)\n";
+}
+
+void rekapRentang() {
+    string dari = bacaTanggal("Dari tanggal   (YYYY-MM-DD): ");
+    string sampai = bacaTanggal("Sampai tanggal (YYYY-MM-DD): ");
+    if (dari > sampai) { cout << "[ERROR] Tanggal awal tidak boleh melebihi tanggal akhir.\n"; return; }
+    rekapAbsensi(dari, sampai);
+}
+
+// ---------- Menu ----------
+
+void tampilMenu() {
+    cout << "\n===== SISTEM ABSENSI KARYAWAN/SISWA v2 =====\n"
+         << " KELOLA ANGGOTA\n"
+         << "  1. Tambah anggota\n"
+         << "  2. Lihat daftar anggota\n"
+         << "  3. Edit anggota\n"
+         << "  4. Hapus anggota\n"
+         << "  5. Lihat kode QR anggota\n"
+         << " ABSENSI\n"
+         << "  6. Catat absensi manual\n"
+         << "  7. Absen otomatis (scan QR)\n"
+         << "  8. Edit absensi\n"
+         << "  9. Hapus absensi\n"
+         << " LAPORAN\n"
+         << " 10. Lihat absensi hari ini\n"
+         << " 11. Rekap keseluruhan\n"
+         << " 12. Rekap berdasarkan rentang tanggal\n"
+         << "  0. Keluar\n";
+}
+
+int main() {
+    muatData();
+    while (true) {
+        tampilMenu();
+        switch (bacaAngka("Pilih menu: ")) {
+            case 1: tambahAnggota(); break;
+            case 2: tampilAnggota(); break;
+            case 3: editAnggota(); break;
+            case 4: hapusAnggota(); break;
+            case 5: tampilKodeQR(); break;
+            case 6: catatAbsen(); break;
+            case 7: absenQR(); break;
+            case 8: editAbsen(); break;
+            case 9: hapusAbsen(); break;
+            case 10: absenHariIni(); break;
+            case 11: rekapAbsensi(); break;
+            case 12: rekapRentang(); break;
+            case 0: cout << "Sampai jumpa!\n"; return 0;
+            default: cout << "Menu tidak valid.\n";
+        }
+    }
+}
